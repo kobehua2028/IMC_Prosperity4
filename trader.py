@@ -13,13 +13,20 @@ from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder
 ROOT_HISTORY_AGGREGATION_MODE = "avg"
 ROOT_HISTORY_LOOKBACK = 100
 ROOT_HISTORY_STATE_KEY = "order_depth_history"
-ROOT_QUOTE_SPREAD = 12
+# Tighter than the ~13-tick market spread to sit at top of book and maximise fills
+ROOT_QUOTE_SPREAD = 10
 ROOT_POSITION_LIMIT = 80
-ROOT_EDGE_SHIFT = 8
-ROOT_TARGET_POSITION = 60
-ROOT_POSITION_BAND = 20
+# Stronger skew so we push bids up aggressively when below target
+ROOT_EDGE_SHIFT = 10
+# Hold more longs to capture the consistent ~+898/day upward drift
+ROOT_TARGET_POSITION = 70
+# Narrowed band so position stays tighter around the higher target (cap = 70+10 = 80)
+ROOT_POSITION_BAND = 10
 ROOT_MIN_ORDER_SIZE = 40
 ROOT_MAX_ORDER_SIZE = 80
+# Upward shift added to quote mid at the start of each day, fading linearly to 0 by
+# end of day.  Biases the bot to buy aggressively early when most drift remains.
+ROOT_EARLY_BUY_BIAS = 6
 ROOT_TRADERDATA_MAX_CHARS = 45000
 ROOT_HISTORY_MIN_SNAPSHOTS = 25
 ROOT_HISTORY_MAX_SNAPSHOTS = 200
@@ -492,12 +499,21 @@ class RootTrader(BaseTrader):
         ask_size = min(self.max_sell_size, max(0, round(ROOT_MIN_ORDER_SIZE + size_range * sell_ratio)))
         return bid_size, ask_size
     
+    def _early_buy_shift(self) -> float:
+        """Upward shift on the quote mid that is largest at timestamp 0 of each day
+        and fades linearly to 0 by the end of the day (timestamp 999900).
+        This biases the bot to buy aggressively early, when the most upward
+        drift (~+898/day) is still ahead."""
+        within_day = self.state.timestamp % 1_000_000
+        fade = max(0.0, 1.0 - within_day / 999_900)
+        return ROOT_EARLY_BUY_BIAS * fade
+
     def get_orders(self):
         current_fair = self.microprice()
         if current_fair is None:
             return {self.name: self.orders}
 
-        quote_mid = current_fair + self._inventory_shift()
+        quote_mid = current_fair + self._inventory_shift() + self._early_buy_shift()
         bid_price = floor(quote_mid - (ROOT_QUOTE_SPREAD / 2))
         ask_price = ceil(quote_mid + (ROOT_QUOTE_SPREAD / 2))
         bid_size, ask_size = self._quote_sizes()
