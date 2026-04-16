@@ -143,7 +143,7 @@ class BaseTrader:
         self.product = name if not product else product
         self.product_group = name
 
-        self.position_limit = 100
+        self.position_limit = 80
         self.initial_position = self.state.position.get(self.product, 0)
         self.expected_position = self.initial_position
 
@@ -208,6 +208,7 @@ class OsmiumTrader(BaseTrader):
     def get_orders(self):
 
         if self.mid_wall:
+            logger.print(f"Bid wall: {self.bid_wall}, Ask wall: {self.ask_wall}, Mid wall: {self.mid_wall}")
             # Taking
             for price, quantity in self.mk_sell_orders.items():
                 if price <= self.mid_wall - 1:
@@ -243,6 +244,8 @@ class OsmiumTrader(BaseTrader):
                     break
             self.bid(bid_price, self.max_buy_size)
             self.ask(ask_price, self.max_sell_size)
+        else:
+            logger.print("No orders in the book")
 
         return {self.name: self.orders}
 
