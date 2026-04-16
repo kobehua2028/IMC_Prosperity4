@@ -4,9 +4,6 @@ from typing import Any
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
-STATIC_PRODUCT = "ASH_COATED_OSMIUM"
-DYNAMIC_PRODUCT = "INTARIAN_PEPPER_ROOT"
-
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
@@ -137,12 +134,11 @@ class Logger:
 logger = Logger()
 
 class BaseTrader:
-    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True, product=None):
+    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, product=None):
         self.orders = []
 
         self.name = name
         self.state = state
-        self.print_logs = print_logs
         self.trader_data = trader_data
         self.product = name if not product else product
         self.prints = prints
@@ -191,18 +187,6 @@ class BaseTrader:
         max_sell_size = self.position_limit + self.initial_position
         return max_buy_size, max_sell_size
 
-    def log(self, kind, message, product_group=None):
-        if product_group is None: product_group = self.product_group
-
-        if product_group == 'ORDERS':
-            group = self.prints.get(product_group, [])
-            group.append({kind: message})
-        else:
-            group = self.prints.get(product_group, {})
-            group[kind] = message
-
-        self.prints[product_group] = group
-
     def bid(self, price: int, quantity: int):
         quantity = min(quantity, self.max_buy_size)
         self.orders.append(Order(self.product, price, abs(quantity)))
@@ -220,9 +204,9 @@ class BaseTrader:
     def get_orders(self):
         return []
 
-class StaticTrader(BaseTrader):
+class OsmiumTrader(BaseTrader):
     def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True):
-        super().__init__(name, state, trader_data, prints, print_logs, STATIC_PRODUCT)
+        super().__init__(name, state, trader_data, prints, print_logs, "ASH_COATED_OSMIUM")
     
     def get_orders(self):
 
@@ -265,9 +249,9 @@ class StaticTrader(BaseTrader):
 
         return {self.name: self.orders}
 
-class DynamicTrader(BaseTrader):
+class RootTrader(BaseTrader):
     def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True):
-        super().__init__(name, state, trader_data, prints, print_logs, DYNAMIC_PRODUCT)
+        super().__init__(name, state, trader_data, prints, print_logs, "INTARIAN_PEPPER_ROOT")
         self.direction = 1  # 1 for long, -1 for short
     
     def get_orders(self):
@@ -303,8 +287,8 @@ class Trader:
         }
 
         product_traders = {
-            STATIC_PRODUCT: StaticTrader,
-            DYNAMIC_PRODUCT: DynamicTrader,
+            "ASH_COATED_OSMIUM": OsmiumTrader,
+            "INTARIAN_PEPPER_ROOT": RootTrader,
         }
 
         result, conversions = {}, 0
