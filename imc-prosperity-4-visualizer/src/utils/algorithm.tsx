@@ -271,11 +271,37 @@ export function parseAlgorithmLogs(resultLog: ResultLog, summary?: AlgorithmSumm
     );
   }
 
+  // If tradeHistory is absent (local backtester output), derive it from ownTrades
+  // embedded in each compressed state row.
+  let tradeHistory = resultLog.tradeHistory ?? [];
+  if (tradeHistory.length === 0) {
+    const seen = new Set<string>();
+    for (const row of data) {
+      for (const trades of Object.values(row.state.ownTrades)) {
+        for (const trade of trades) {
+          const key = `${trade.symbol}-${trade.timestamp}-${trade.price}-${trade.quantity}-${trade.buyer}-${trade.seller}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            tradeHistory.push({
+              timestamp: trade.timestamp,
+              buyer: trade.buyer,
+              seller: trade.seller,
+              currency: '',
+              price: trade.price,
+              quantity: trade.quantity,
+              symbol: trade.symbol,
+            });
+          }
+        }
+      }
+    }
+  }
+
   return {
     summary,
     activityLogs,
     data,
-    tradeHistory: resultLog.tradeHistory ?? [],
+    tradeHistory,
   };
 }
 
