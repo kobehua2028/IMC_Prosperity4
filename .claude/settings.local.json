@@ -4,7 +4,8 @@
       "Bash(grep -E \"\\\\.\\(tsx|ts\\)$\")",
       "Bash(python visualize/market_viz.py data/ROUND_1/ROUND1 visualize/viz_round1.html)",
       "Bash(python visualize/market_viz.py data/TUTORIAL_ROUND_1 visualize/viz_tutorial.html)",
-      "Bash(python -c \"import flask; print\\('flask ok'\\)\")"
+      "Bash(python -c \"import flask; print\\('flask ok'\\)\")",
+      "Bash(awk -F';' '{print $2, $3}')"
     ]
   }
 }

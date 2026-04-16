@@ -159,13 +159,36 @@ def build_payload(prices: dict, trades: dict, folder_name: str) -> dict:
         tprice = [r["price"]    for r in trecs]
         tqty   = [r["quantity"] for r in trecs]
 
+        # Quote rule classification, with tick rule fallback
+        price_lookup = {(r["day"], r["timestamp"]): (r["bid_price_1"], r["ask_price_1"]) for r in precs}
+        tside = []
+        last_price = None
+        for r in trecs:
+            b1, a1 = price_lookup.get((r["day"], r["timestamp"]), (None, None))
+            p = r["price"]
+            if a1 is not None and p >= a1:
+                side = "buy"
+            elif b1 is not None and p <= b1:
+                side = "sell"
+            elif last_price is not None:
+                if p > last_price:
+                    side = "buy"
+                elif p < last_price:
+                    side = "sell"
+                else:
+                    side = "unknown"
+            else:
+                side = "unknown"
+            tside.append(side)
+            last_price = p
+
         product_data[product] = {
             "xs": xs, "mid": mid,
             "bid1": bid1, "ask1": ask1,
             "bid2": bid2, "ask2": ask2,
             "bid_vol1": bid_vol1, "ask_vol1": ask_vol1,
             "bid_vol2": bid_vol2, "ask_vol2": ask_vol2,
-            "txs": txs, "tprice": tprice, "tqty": tqty,
+            "txs": txs, "tprice": tprice, "tqty": tqty, "tside": tside,
         }
 
     return {
@@ -230,6 +253,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <select id="prod-sel"></select>
   <div class="btn-group" id="day-btns"></div>
   <div class="sep"></div>
+  <label>Trades</label>
+  <div class="btn-group" id="trade-btns">
+    <button class="active" data-side="all">All</button>
+    <button data-side="buy">Buy</button>
+    <button data-side="sell">Sell</button>
+    <button data-side="unknown">Unknown</button>
+  </div>
+  <div class="sep"></div>
   <button id="reset-btn">Reset Zoom</button>
 </div>
 
@@ -285,6 +316,7 @@ const CFG = {
 /* ---- state ---- */
 let product      = null;
 let dayFilter    = null;   // null → all days
+let tradeFilter  = 'all';  // 'all' | 'buy' | 'sell' | 'unknown'
 let xRange       = null;   // shared zoom state [min, max]
 let syncLock     = false;  // prevents relayout ping-pong
 
@@ -349,10 +381,19 @@ function render() {
   };
 
   // ---- 1. Price chart ----
-  const [pxs, mid, bid1, ask1, bid2, ask2, txsP, tpriceP, tqtyP] = filterToDay(
+  const [pxs, mid, bid1, ask1, bid2, ask2, txsAll, tpriceAll, tqtyAll, tsideAll] = filterToDay(
     pd.xs, pd.mid, pd.bid1, pd.ask1, pd.bid2, pd.ask2,
-    pd.txs, pd.tprice, pd.tqty,
+    pd.txs, pd.tprice, pd.tqty, pd.tside,
   );
+
+  // Apply trade side filter
+  const txsP = [], tpriceP = [], tqtyP = [], tsideP = [];
+  for (let i = 0; i < txsAll.length; i++) {
+    if (tradeFilter === 'all' || tsideAll[i] === tradeFilter) {
+      txsP.push(txsAll[i]); tpriceP.push(tpriceAll[i]);
+      tqtyP.push(tqtyAll[i]); tsideP.push(tsideAll[i]);
+    }
+  }
 
   const priceTraces = [
     // L2 bid/ask fill first (bottom layer)
@@ -395,25 +436,41 @@ function render() {
     },
   ];
 
-  // Trade dots overlaid on price chart
-  if (txsP.length > 0) {
+  // Trade dots overlaid on price chart — color-coded by side
+  const SIDE_STYLE = {
+    buy:     { color: '#3fb950', symbol: 'triangle-up',   label: 'Buy' },
+    sell:    { color: '#f85149', symbol: 'triangle-down', label: 'Sell' },
+    unknown: { color: '#e3b341', symbol: 'circle-open',   label: 'Unknown' },
+  };
+  const sides = tradeFilter === 'all' ? ['buy', 'sell', 'unknown'] : [tradeFilter];
+  for (const side of sides) {
+    const sx = [], sy = [], sq = [];
+    for (let i = 0; i < txsP.length; i++) {
+      if (tsideP[i] === side) { sx.push(txsP[i]); sy.push(tpriceP[i]); sq.push(tqtyP[i]); }
+    }
+    if (sx.length === 0) continue;
+    const st = SIDE_STYLE[side];
     priceTraces.push({
-      x: txsP, y: tpriceP,
-      name: 'Trades',
+      x: sx, y: sy,
+      name: `${st.label} trades`,
       type: 'scatter', mode: 'markers',
-      marker: { color: '#e3b341', size: 6, symbol: 'circle-open',
-                line: { width: 1.8, color: '#e3b341' } },
-      customdata: tqtyP,
-      hovertemplate: 'Price: %{y:.2f}<br>Qty: %{customdata}<extra>Trade</extra>',
+      marker: { color: st.color, size: 6, symbol: st.symbol,
+                line: { width: 1.8, color: st.color } },
+      customdata: sq,
+      hovertemplate: `Price: %{y:.2f}<br>Qty: %{customdata}<extra>${st.label} Trade</extra>`,
     });
   }
 
   // Stats
   const midVals = mid.filter(v => v != null);
   if (midVals.length > 0) {
-    const lo = Math.min(...midVals), hi = Math.max(...midVals);
-    const spread = ask1.map((a, i) => a != null && bid1[i] != null ? a - bid1[i] : null).filter(v => v != null);
-    const avgSpread = spread.length ? (spread.reduce((a, b) => a + b, 0) / spread.length).toFixed(2) : 'n/a';
+    let lo = midVals[0], hi = midVals[0];
+    for (const v of midVals) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    let spreadSum = 0, spreadCount = 0;
+    for (let i = 0; i < ask1.length; i++) {
+      if (ask1[i] != null && bid1[i] != null) { spreadSum += ask1[i] - bid1[i]; spreadCount++; }
+    }
+    const avgSpread = spreadCount ? (spreadSum / spreadCount).toFixed(2) : 'n/a';
     document.getElementById('price-stats').innerHTML =
       `<span>Low <b>${lo.toFixed(2)}</b></span>` +
       `<span>High <b>${hi.toFixed(2)}</b></span>` +
@@ -429,7 +486,13 @@ function render() {
   }, CFG);
 
   // ---- 2. Volume chart ----
-  const [tvxs, tvprice, tvqty] = filterToDay(pd.txs, pd.tprice, pd.tqty);
+  const [tvxsAll, tvpriceAll, tvqtyAll, tvsideAll] = filterToDay(pd.txs, pd.tprice, pd.tqty, pd.tside);
+  const tvxs = [], tvprice = [], tvqty = [];
+  for (let i = 0; i < tvxsAll.length; i++) {
+    if (tradeFilter === 'all' || tvsideAll[i] === tradeFilter) {
+      tvxs.push(tvxsAll[i]); tvprice.push(tvpriceAll[i]); tvqty.push(tvqtyAll[i]);
+    }
+  }
 
   if (tvxs.length === 0) {
     document.getElementById('vol-chart').innerHTML =
@@ -538,15 +601,19 @@ function render() {
 }
 
 /* ---- zoom synchronisation ---- */
+const zoomHandlers = {};
 function attachZoomSync() {
   const ids = ['price-chart', 'vol-chart', 'depth-chart'];
   ids.forEach(id => {
     const el = document.getElementById(id);
     if (!el || !el._fullLayout) return;
 
-    // Re-attach (Plotly.react removes old listeners)
-    el.removeAllListeners && el.removeAllListeners('plotly_relayout');
-    el.on('plotly_relayout', ev => {
+    // Remove previous listener before attaching a new one
+    if (zoomHandlers[id]) {
+      el.removeListener('plotly_relayout', zoomHandlers[id]);
+    }
+
+    zoomHandlers[id] = ev => {
       if (syncLock) return;
       let newRange = null;
       if (ev['xaxis.range[0]'] !== undefined && ev['xaxis.range[1]'] !== undefined) {
@@ -558,17 +625,19 @@ function attachZoomSync() {
       }
       xRange = newRange;
       syncLock = true;
-      ids.filter(c => c !== id).forEach(otherId => {
+      const others = ids.filter(c => c !== id).map(otherId => {
         const other = document.getElementById(otherId);
-        if (!other || !other._fullLayout) return;
+        if (!other || !other._fullLayout) return Promise.resolve();
         if (xRange) {
-          Plotly.relayout(other, { 'xaxis.range[0]': xRange[0], 'xaxis.range[1]': xRange[1] });
+          return Plotly.relayout(other, { 'xaxis.range[0]': xRange[0], 'xaxis.range[1]': xRange[1] });
         } else {
-          Plotly.relayout(other, { 'xaxis.autorange': true });
+          return Plotly.relayout(other, { 'xaxis.autorange': true });
         }
       });
-      syncLock = false;
-    });
+      Promise.all(others).then(() => { syncLock = false; });
+    };
+
+    el.on('plotly_relayout', zoomHandlers[id]);
   });
 }
 
@@ -603,6 +672,15 @@ function init() {
   }
   makeBtn('All Days', null);
   DATA.sorted_days.forEach(d => makeBtn(dayLabel(d), d));
+
+  document.querySelectorAll('#trade-btns button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      tradeFilter = btn.dataset.side;
+      document.querySelectorAll('#trade-btns button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      render();
+    });
+  });
 
   document.getElementById('reset-btn').addEventListener('click', () => {
     xRange = null; render();

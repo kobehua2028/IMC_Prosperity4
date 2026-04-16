@@ -320,6 +320,7 @@ class RootTrader(BaseTrader):
             elif self.expected_position < 0 and price <= current_fair + self.PASSIVE_LOOKAHEAD:
                 self.bid(price, min(quantity, abs(self.expected_position)))
 
+        self.bid(self.bid_wall + 1, self.total_sell_volume) if self.bid_wall is not None else None
         for price, quantity in self.mk_buy_orders.items():
             if price >= exit_fair + self.TAKE_EDGE:
                 self.ask(price, quantity)
