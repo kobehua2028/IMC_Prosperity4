@@ -1,5 +1,5 @@
-import string
 import json
+from math import ceil, floor
 from typing import Any
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
@@ -134,7 +134,7 @@ class Logger:
 logger = Logger()
 
 class BaseTrader:
-    def __init__(self, name: str, state: TradingState, trader_data: str, product=None):
+    def __init__(self, name: str, state: TradingState, trader_data: dict[str, Any], product=None):
         self.orders = []
 
         self.name = name
@@ -142,6 +142,10 @@ class BaseTrader:
         self.trader_data = trader_data
         self.product = name if not product else product
         self.product_group = name
+        self.product_state = self.trader_data.get(self.product, {})
+        if not isinstance(self.product_state, dict):
+            self.product_state = {}
+        self.trader_data[self.product] = self.product_state
 
         self.position_limit = 80
         self.initial_position = self.state.position.get(self.product, 0)
@@ -154,14 +158,12 @@ class BaseTrader:
 
     # splits the order book into buy and sell orders for current product
     def get_order_book(self):
-        order_depth, buy_orders, sell_orders = {}, {}, {}
+        order_depth = self.state.order_depths.get(self.name)
+        if order_depth is None:
+            return {}, {}
 
-        try: order_depth: OrderDepth = self.state.order_depths[self.name]
-        except: pass
-        try: buy_orders = {bp: abs(bv) for bp, bv in sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)}
-        except: pass
-        try: sell_orders = {sp: abs(sv) for sp, sv in sorted(order_depth.sell_orders.items(), key=lambda x: x[0])}
-        except: pass
+        buy_orders = {bp: abs(bv) for bp, bv in sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)}
+        sell_orders = {sp: abs(sv) for sp, sv in sorted(order_depth.sell_orders.items(), key=lambda x: x[0])}
 
         return buy_orders, sell_orders
 
@@ -187,90 +189,148 @@ class BaseTrader:
         return max_buy_size, max_sell_size
 
     def bid(self, price: int, quantity: int):
-        quantity = min(quantity, self.max_buy_size)
+        quantity = min(abs(quantity), self.max_buy_size)
+        if quantity <= 0:
+            return
         self.orders.append(Order(self.product, price, abs(quantity)))
         self.max_buy_size -= abs(quantity)
         self.expected_position += abs(quantity)
 
     def ask(self, price: int, quantity: int):
-        quantity = min(quantity, self.max_sell_size)
+        quantity = min(abs(quantity), self.max_sell_size)
+        if quantity <= 0:
+            return
         self.orders.append(Order(self.product, price, -1 * abs(quantity)))
         self.max_sell_size -= abs(quantity)
         self.expected_position -= abs(quantity)
+
+    def market_mid(self):
+        if self.bid_wall is not None and self.ask_wall is not None:
+            return (self.bid_wall + self.ask_wall) / 2
+        if self.bid_wall is not None:
+            return float(self.bid_wall)
+        if self.ask_wall is not None:
+            return float(self.ask_wall)
+        return None
+
+    def microprice(self):
+        if self.bid_wall is None or self.ask_wall is None:
+            return self.market_mid()
+
+        bid_volume = self.mk_buy_orders.get(self.bid_wall, 0)
+        ask_volume = self.mk_sell_orders.get(self.ask_wall, 0)
+        if bid_volume + ask_volume == 0:
+            return self.market_mid()
+
+        return (self.bid_wall * ask_volume + self.ask_wall * bid_volume) / (bid_volume + ask_volume)
 
     def get_orders(self):
         return []
 
 class OsmiumTrader(BaseTrader):
-    def __init__(self, name: str, state: TradingState, trader_data: str):
+    FAIR_VALUE = 10000
+    TAKE_EDGE = 1
+    MAKE_EDGE = 2
+    PASSIVE_SIZE = 20
+    EWMA_ALPHA = 0.1
+    EWMA_WEIGHT = 0.5
+    INVENTORY_SKEW = 0.02
+
+    def __init__(self, name: str, state: TradingState, trader_data: dict[str, Any]):
         super().__init__(name, state, trader_data, "ASH_COATED_OSMIUM")
+
+    def fair_value(self):
+        book_fair = self.microprice()
+        if book_fair is None:
+            return self.FAIR_VALUE - self.initial_position * self.INVENTORY_SKEW
+
+        previous_ewma = self.product_state.get("ewma", book_fair)
+        ewma = self.EWMA_ALPHA * book_fair + (1 - self.EWMA_ALPHA) * previous_ewma
+        self.product_state["ewma"] = round(ewma, 4)
+
+        model_fair = (1 - self.EWMA_WEIGHT) * self.FAIR_VALUE + self.EWMA_WEIGHT * ewma
+        return model_fair - self.initial_position * self.INVENTORY_SKEW
     
     def get_orders(self):
+        fair = self.fair_value()
 
-        if self.mid_wall:
-            logger.print(f"Bid wall: {self.bid_wall}, Ask wall: {self.ask_wall}, Mid wall: {self.mid_wall}")
-            # Taking
-            for price, quantity in self.mk_sell_orders.items():
-                if price <= self.mid_wall - 1:
-                    self.bid(price, quantity)
-                elif price <= self.mid_wall and self.initial_position < 0:
-                    self.bid(price, min(abs(quantity), abs(self.initial_position)))
-            
-            for price, quantity in self.mk_buy_orders.items():
-                if price >= self.mid_wall + 1:
-                    self.ask(price, quantity)
-                elif price >= self.mid_wall and self.initial_position > 0:
-                    self.ask(price, min(abs(quantity), abs(self.initial_position)))
-
-            # Making
-            bid_price = int(self.bid_wall + 1)
-            ask_price = int(self.ask_wall - 1)
-
-            for price, quantity in self.mk_buy_orders.items():
-                overbid = price + 1
-                if overbid < self.mid_wall and self.initial_position > 0:
-                    bid_price = max(bid_price, overbid)
-                    break
-                elif price < self.mid_wall:
-                    bid_price = max(bid_price, price)
-                    break
-            for price, quantity in self.mk_sell_orders.items():
-                underbid = price - 1
-                if underbid > self.mid_wall and self.initial_position < 0:
-                    ask_price = min(ask_price, underbid)
-                    break
-                elif price > self.mid_wall:
-                    ask_price = min(ask_price, price)
-                    break
-            self.bid(bid_price, self.max_buy_size)
-            self.ask(ask_price, self.max_sell_size)
-        else:
+        if self.bid_wall is None and self.ask_wall is None:
             logger.print("No orders in the book")
+            return {self.name: self.orders}
+
+        # Take clear dislocations around the stable 10,000 anchor.
+        for price, quantity in self.mk_sell_orders.items():
+            if price <= fair - self.TAKE_EDGE:
+                self.bid(price, quantity)
+            elif self.expected_position < 0 and price <= fair:
+                self.bid(price, min(quantity, abs(self.expected_position)))
+
+        for price, quantity in self.mk_buy_orders.items():
+            if price >= fair + self.TAKE_EDGE:
+                self.ask(price, quantity)
+            elif self.expected_position > 0 and price >= fair:
+                self.ask(price, min(quantity, self.expected_position))
+
+        bid_ceiling = floor(fair - self.MAKE_EDGE)
+        ask_floor = ceil(fair + self.MAKE_EDGE)
+
+        if self.bid_wall is not None:
+            bid_price = min(self.bid_wall + 1, bid_ceiling)
+        else:
+            bid_price = bid_ceiling
+
+        if self.ask_wall is not None:
+            ask_price = max(self.ask_wall - 1, ask_floor)
+        else:
+            ask_price = ask_floor
+
+        if self.ask_wall is not None:
+            bid_price = min(bid_price, self.ask_wall - 1)
+        if self.bid_wall is not None:
+            ask_price = max(ask_price, self.bid_wall + 1)
+
+        if bid_price < ask_price:
+            bid_size = min(self.max_buy_size, self.PASSIVE_SIZE + max(0, -self.expected_position))
+            ask_size = min(self.max_sell_size, self.PASSIVE_SIZE + max(0, self.expected_position))
+            self.bid(bid_price, bid_size)
+            self.ask(ask_price, ask_size)
 
         return {self.name: self.orders}
 
 class RootTrader(BaseTrader):
-    def __init__(self, name: str, state: TradingState, trader_data: str):
+    DRIFT_PER_TIMESTAMP = 0.001
+    ROUND_END_TIMESTAMP = 999900
+    TAKE_EDGE = 2
+    PASSIVE_LOOKAHEAD = 20
+
+    def __init__(self, name: str, state: TradingState, trader_data: dict[str, Any]):
         super().__init__(name, state, trader_data, "INTARIAN_PEPPER_ROOT")
-        self.direction = 1  # 1 for long, -1 for short
     
     def get_orders(self):
-        # Seems like an assets that only moves in one direction, so we can just keep bidding until we hit the position limit
-        if self.mid_wall:
-            listed_sell_orders = list(self.mk_sell_orders.items())
-            listed_buy_orders = list(self.mk_buy_orders.items())
-            i = 0
-            while self.max_buy_size > 0 and i < len(listed_sell_orders):
-                buy_price, buy_quantity = listed_sell_orders[i]
-                self.bid(buy_price, buy_quantity)
-                i += 1
-            
-            j = 0
-            while self.max_sell_size > 0 and j < len(listed_buy_orders):
-                sell_price, sell_quantity = listed_buy_orders[j]
-                if sell_price > self.mid_wall:
-                    self.ask(sell_price, sell_quantity)
-                j +=1
+        current_fair = self.microprice()
+        if current_fair is None:
+            return {self.name: self.orders}
+
+        remaining_drift = max(0, self.ROUND_END_TIMESTAMP - self.state.timestamp) * self.DRIFT_PER_TIMESTAMP
+        exit_fair = current_fair + remaining_drift
+
+        for price, quantity in self.mk_sell_orders.items():
+            if price <= exit_fair - self.TAKE_EDGE:
+                self.bid(price, quantity)
+            elif self.expected_position < 0 and price <= current_fair + self.PASSIVE_LOOKAHEAD:
+                self.bid(price, min(quantity, abs(self.expected_position)))
+
+        for price, quantity in self.mk_buy_orders.items():
+            if price >= exit_fair + self.TAKE_EDGE:
+                self.ask(price, quantity)
+
+        if self.max_buy_size > 0 and self.bid_wall is not None:
+            bid_ceiling = floor(current_fair + min(self.PASSIVE_LOOKAHEAD, remaining_drift) - self.TAKE_EDGE)
+            bid_price = min(self.bid_wall + 1, bid_ceiling)
+            if self.ask_wall is not None:
+                bid_price = min(bid_price, self.ask_wall - 1)
+            if bid_price > 0:
+                self.bid(bid_price, self.max_buy_size)
 
         return {self.name: self.orders}
 
@@ -278,13 +338,12 @@ class Trader:
 
     def run(self, state: TradingState):
         result:dict[str,list[Order]] = {}
-        new_trader_data = {}
-        prints = {
-            "GENERAL": {
-                "TIMESTAMP": state.timestamp,
-                "POSITIONS": state.position
-            },
-        }
+        try:
+            new_trader_data = json.loads(state.traderData) if state.traderData else {}
+            if not isinstance(new_trader_data, dict):
+                new_trader_data = {}
+        except Exception:
+            new_trader_data = {}
 
         product_traders = {
             "ASH_COATED_OSMIUM": OsmiumTrader,
@@ -294,10 +353,10 @@ class Trader:
         result, conversions = {}, 0
         for symbol, product_trader in product_traders.items():
             if symbol in state.order_depths:
-                trader = product_trader(symbol, state, json.dumps(new_trader_data))
+                trader = product_trader(symbol, state, new_trader_data)
                 result.update(trader.get_orders())
 
-        try: final_trader_data = json.dumps(new_trader_data)
+        try: final_trader_data = json.dumps(new_trader_data, separators=(",", ":"))
         except: final_trader_data = ''
         logger.flush(state, result, conversions, final_trader_data)
 
