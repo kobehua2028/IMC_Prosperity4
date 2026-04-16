@@ -72,7 +72,7 @@ export function Chart({ title, options, series, min, max, controls }: ChartProps
         panKey: 'shift',
         numberFormatter: formatNumber,
         events: {
-          load() {
+          load(this: Highcharts.Chart) {
             Highcharts.addEvent(this.tooltip, 'headerFormatter', (e: any) => {
               if (e.isFooter) {
                 return true;
@@ -91,6 +91,21 @@ export function Chart({ title, options, series, min, max, controls }: ChartProps
               e.text = `Timestamp ${formatNumber(timestamp)}<br/>`;
               return false;
             });
+
+            const chart = this;
+            if (chart.xAxis[0]) {
+              Highcharts.addEvent(chart.xAxis[0], 'afterSetExtremes', function (e: any) {
+                if (e.trigger === 'sync') return;
+                const { min, max } = e;
+                Highcharts.charts.forEach(otherChart => {
+                  if (!otherChart || otherChart === chart) return;
+                  const axis = otherChart.xAxis[0];
+                  if (axis) {
+                    axis.setExtremes(min, max, true, false, { trigger: 'sync' });
+                  }
+                });
+              });
+            }
           },
           fullscreenOpen(this: Highcharts.Chart) {
             (this as any).tooltip.update({ outside: false });

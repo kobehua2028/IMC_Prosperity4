@@ -4,8 +4,8 @@ from typing import Any
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
-STATIC_PRODUCT = "TOMATOES"
-DYNAMIC_PRODUCT = "EMERALDS"
+STATIC_PRODUCT = "ASH_COATED_OSMIUM"
+DYNAMIC_PRODUCT = "INTARIAN_PEPPER_ROOT"
 
 class Logger:
     def __init__(self) -> None:
@@ -137,7 +137,7 @@ class Logger:
 logger = Logger()
 
 class BaseTrader:
-    def __init__(self, name: str, state: TradingState, print_logs: bool = True, trader_data: str, product=None):
+    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True, product=None):
         self.orders = []
 
         self.name = name
@@ -145,27 +145,35 @@ class BaseTrader:
         self.print_logs = print_logs
         self.trader_data = trader_data
         self.product = name if not product else product
+        self.prints = prints
+        self.product_group = name
 
         self.position_limit = 100
         self.initial_position = self.state.position.get(self.product, 0)
         self.expected_position = self.initial_position
 
-        self.mk_buy_orders, self.mk_sell_orders = get_order_book()
+        self.mk_buy_orders, self.mk_sell_orders = self.get_order_book()
         self.bid_wall, self.mid_wall, self.ask_wall = self.get_walls()
         self.total_buy_volume, self.total_sell_volume = self.total_trading_volume()
         self.max_buy_size, self.max_sell_size = self.max_trade_size()
 
     # splits the order book into buy and sell orders for current product
     def get_order_book(self):
-        mk_buy_orders = self.state.order_depths[self.product].buy_orders
-        mk_sell_orders = self.state.order_depths[self.product].sell_orders
+        order_depth, buy_orders, sell_orders = {}, {}, {}
 
-        return mk_buy_orders, mk_sell_orders
+        try: order_depth: OrderDepth = self.state.order_depths[self.name]
+        except: pass
+        try: buy_orders = {bp: abs(bv) for bp, bv in sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)}
+        except: pass
+        try: sell_orders = {sp: abs(sv) for sp, sv in sorted(order_depth.sell_orders.items(), key=lambda x: x[0])}
+        except: pass
+
+        return buy_orders, sell_orders
 
     # Find the spread of the order book and the bid and ask walls
-    def get_walls():
-        bid_wall = min(self.mk_buy_orders.keys()) if self.mk_buy_orders else None
-        ask_wall = max(self.mk_sell_orders.keys()) if self.mk_sell_orders else None
+    def get_walls(self):
+        bid_wall = max(self.mk_buy_orders.keys()) if self.mk_buy_orders else None
+        ask_wall = min(self.mk_sell_orders.keys()) if self.mk_sell_orders else None
         mid_wall = (bid_wall + ask_wall) / 2 if bid_wall and ask_wall else None
         return bid_wall, mid_wall, ask_wall
 
@@ -183,83 +191,131 @@ class BaseTrader:
         max_sell_size = self.position_limit + self.initial_position
         return max_buy_size, max_sell_size
 
-    def log(self, message: str):
-        if self.print_logs:
-            logger.print(f"{self.name}: {message}")
+    def log(self, kind, message, product_group=None):
+        if product_group is None: product_group = self.product_group
+
+        if product_group == 'ORDERS':
+            group = self.prints.get(product_group, [])
+            group.append({kind: message})
+        else:
+            group = self.prints.get(product_group, {})
+            group[kind] = message
+
+        self.prints[product_group] = group
 
     def bid(self, price: int, quantity: int):
         quantity = min(quantity, self.max_buy_size)
-        self.orders.append(Order(self.product, price, quantity))
-        self.log(f"{self.name} bids {quantity} at {price}")
-        self.max_buy_size -= quantity
-        self.expected_position += quantity
+        self.orders.append(Order(self.product, price, abs(quantity)))
+        self.log("BID", f"{self.name} bids {quantity} at {price}")
+        self.max_buy_size -= abs(quantity)
+        self.expected_position += abs(quantity)
 
     def ask(self, price: int, quantity: int):
         quantity = min(quantity, self.max_sell_size)
-        self.orders.append(Order(self.product, price, quantity))
-        self.log(f"{self.name} asks {quantity} at {price}")
-        self.max_sell_size -= quantity
-        self.expected_position -= quantity
+        self.orders.append(Order(self.product, price, -1 * abs(quantity)))
+        self.log("ASK", f"{self.name} asks {quantity} at {price}")
+        self.max_sell_size -= abs(quantity)
+        self.expected_position -= abs(quantity)
 
     def get_orders(self):
         return []
 
 class StaticTrader(BaseTrader):
-    def __init__(self, name: str, state: TradingState, print_logs: bool = True, trader_data: str):
-        super().__init__(name, state, print_logs, trader_data, STATIC_PRODUCT)
+    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True):
+        super().__init__(name, state, trader_data, prints, print_logs, STATIC_PRODUCT)
     
     def get_orders(self):
-        # Taking
-        for price, quantity in self.mk_sell_orders.items():
-            if price < self.mid_wall and quantity < 0:
-                self.bid(price, -quantity)
-        
-        for price, quantity in self.mk_buy_orders.items():
-            if price > self.mid_wall and quantity > 0:
-                self.ask(price, quantity)
 
+        if self.mid_wall:
+            # Taking
+            for price, quantity in self.mk_sell_orders.items():
+                if price <= self.mid_wall - 1:
+                    self.bid(price, quantity)
+                elif price <= self.mid_wall and self.initial_position < 0:
+                    self.bid(price, min(abs(quantity), abs(self.initial_position)))
+            
+            for price, quantity in self.mk_buy_orders.items():
+                if price >= self.mid_wall + 1:
+                    self.ask(price, quantity)
+                elif price >= self.mid_wall and self.initial_position > 0:
+                    self.ask(price, min(abs(quantity), abs(self.initial_position)))
 
-        # Making
+            # Making
+            bid_price = int(self.bid_wall + 1)
+            ask_price = int(self.ask_wall - 1)
 
+            for price, quantity in self.mk_buy_orders.items():
+                overbid = price + 1
+                if overbid < self.mid_wall and self.initial_position > 0:
+                    bid_price = max(bid_price, overbid)
+                    break
+                elif price < self.mid_wall:
+                    bid_price = max(bid_price, price)
+                    break
+            for price, quantity in self.mk_sell_orders.items():
+                underbid = price - 1
+                if underbid > self.mid_wall and self.initial_position < 0:
+                    ask_price = min(ask_price, underbid)
+                    break
+                elif price > self.mid_wall:
+                    ask_price = min(ask_price, price)
+                    break
+            self.bid(bid_price, self.max_buy_size)
+            self.ask(ask_price, self.max_sell_size)
+
+        return {self.name: self.orders}
+
+class DynamicTrader(BaseTrader):
+    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True):
+        super().__init__(name, state, trader_data, prints, print_logs, DYNAMIC_PRODUCT)
+        self.direction = 1  # 1 for long, -1 for short
+    
+    def get_orders(self):
+        # Seems like an assets that only moves in one direction, so we can just keep bidding until we hit the position limit
+        if self.mid_wall:
+            listed_sell_orders = list(self.mk_sell_orders.items())
+            listed_buy_orders = list(self.mk_buy_orders.items())
+            i = 0
+            while self.max_buy_size > 0 and i < len(listed_sell_orders):
+                buy_price, buy_quantity = listed_sell_orders[i]
+                self.bid(buy_price, buy_quantity)
+                i += 1
+            
+            j = 0
+            while self.max_sell_size > 0 and j < len(listed_buy_orders):
+                sell_price, sell_quantity = listed_buy_orders[j]
+                if sell_price > self.mid_wall:
+                    self.ask(sell_price, sell_quantity)
+                j +=1
+
+        return {self.name: self.orders}
 
 class Trader:
 
-    def bid(self):
-        return 15
-    
     def run(self, state: TradingState):
-        """Only method required. It takes all buy and sell orders for all
-        symbols as an input, and outputs a list of orders to be sent."""
+        result:dict[str,list[Order]] = {}
+        new_trader_data = {}
+        prints = {
+            "GENERAL": {
+                "TIMESTAMP": state.timestamp,
+                "POSITIONS": state.position
+            },
+        }
 
-        result = {}
-        conversions = 0
-        trader_data = ""
+        product_traders = {
+            STATIC_PRODUCT: StaticTrader,
+            DYNAMIC_PRODUCT: DynamicTrader,
+        }
 
-        logger.print("traderData: " + state.traderData)
-        logger.print("Observations: " + str(state.observations))
+        result, conversions = {}, 0
+        for symbol, product_trader in product_traders.items():
+            if symbol in state.order_depths:
+                trader = product_trader(symbol, state, json.dumps(new_trader_data),
+  prints)
+                result.update(trader.get_orders())
 
-        # Orders to be placed on exchange matching engine
-        result = {}
-        for product in state.order_depths:
-            order_depth: OrderDepth = state.order_depths[product]
-            orders: List[Order] = []
-            acceptable_price = 10  # Participant should calculate this value
-            logger.print("Acceptable price : " + str(acceptable_price))
-            logger.print("Buy Order depth : " + str(len(order_depth.buy_orders)) + ", Sell order depth : " + str(len(order_depth.sell_orders)))
-    
-            if len(order_depth.sell_orders) != 0:
-                best_ask, best_ask_amount = list(order_depth.sell_orders.items())[0]
-                if int(best_ask) < acceptable_price:
-                    logger.print("BUY", str(-best_ask_amount) + "x", best_ask)
-                    orders.append(Order(product, best_ask, -best_ask_amount))
-    
-            if len(order_depth.buy_orders) != 0:
-                best_bid, best_bid_amount = list(order_depth.buy_orders.items())[0]
-                if int(best_bid) > acceptable_price:
-                    logger.print("SELL", str(best_bid_amount) + "x", best_bid)
-                    orders.append(Order(product, best_bid, -best_bid_amount))
-            
-            result[product] = orders
-    
-        logger.flush(state, result, conversions, trader_data)
-        return result, conversions, trader_data
+        try: final_trader_data = json.dumps(new_trader_data)
+        except: final_trader_data = ''
+        logger.flush(state, result, conversions, final_trader_data)
+
+        return result, conversions, final_trader_data
