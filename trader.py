@@ -134,14 +134,13 @@ class Logger:
 logger = Logger()
 
 class BaseTrader:
-    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, product=None):
+    def __init__(self, name: str, state: TradingState, trader_data: str, product=None):
         self.orders = []
 
         self.name = name
         self.state = state
         self.trader_data = trader_data
         self.product = name if not product else product
-        self.prints = prints
         self.product_group = name
 
         self.position_limit = 100
@@ -190,14 +189,12 @@ class BaseTrader:
     def bid(self, price: int, quantity: int):
         quantity = min(quantity, self.max_buy_size)
         self.orders.append(Order(self.product, price, abs(quantity)))
-        self.log("BID", f"{self.name} bids {quantity} at {price}")
         self.max_buy_size -= abs(quantity)
         self.expected_position += abs(quantity)
 
     def ask(self, price: int, quantity: int):
         quantity = min(quantity, self.max_sell_size)
         self.orders.append(Order(self.product, price, -1 * abs(quantity)))
-        self.log("ASK", f"{self.name} asks {quantity} at {price}")
         self.max_sell_size -= abs(quantity)
         self.expected_position -= abs(quantity)
 
@@ -205,8 +202,8 @@ class BaseTrader:
         return []
 
 class OsmiumTrader(BaseTrader):
-    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True):
-        super().__init__(name, state, trader_data, prints, print_logs, "ASH_COATED_OSMIUM")
+    def __init__(self, name: str, state: TradingState, trader_data: str):
+        super().__init__(name, state, trader_data, "ASH_COATED_OSMIUM")
     
     def get_orders(self):
 
@@ -250,8 +247,8 @@ class OsmiumTrader(BaseTrader):
         return {self.name: self.orders}
 
 class RootTrader(BaseTrader):
-    def __init__(self, name: str, state: TradingState, trader_data: str, prints: dict, print_logs: bool = True):
-        super().__init__(name, state, trader_data, prints, print_logs, "INTARIAN_PEPPER_ROOT")
+    def __init__(self, name: str, state: TradingState, trader_data: str):
+        super().__init__(name, state, trader_data, "INTARIAN_PEPPER_ROOT")
         self.direction = 1  # 1 for long, -1 for short
     
     def get_orders(self):
@@ -294,8 +291,7 @@ class Trader:
         result, conversions = {}, 0
         for symbol, product_trader in product_traders.items():
             if symbol in state.order_depths:
-                trader = product_trader(symbol, state, json.dumps(new_trader_data),
-  prints)
+                trader = product_trader(symbol, state, json.dumps(new_trader_data))
                 result.update(trader.get_orders())
 
         try: final_trader_data = json.dumps(new_trader_data)
