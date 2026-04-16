@@ -2,7 +2,131 @@ import json
 from math import ceil, floor
 from typing import Any
 
+import jsonpickle
+
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+
+# RootTrader history aggregation mode:
+# - "avg": average of all price levels on that side at each timestamp
+# - "max": highest price level on that side at each timestamp
+# - "min": lowest price level on that side at each timestamp
+ROOT_HISTORY_AGGREGATION_MODE = "avg"
+ROOT_HISTORY_LOOKBACK = 100
+ROOT_HISTORY_STATE_KEY = "order_depth_history"
+ROOT_QUOTE_SPREAD = 12
+ROOT_POSITION_LIMIT = 80
+ROOT_EDGE_SHIFT = 8
+ROOT_TARGET_POSITION = 60
+ROOT_POSITION_BAND = 20
+ROOT_MIN_ORDER_SIZE = 40
+ROOT_MAX_ORDER_SIZE = 80
+ROOT_TRADERDATA_MAX_CHARS = 45000
+ROOT_HISTORY_MIN_SNAPSHOTS = 25
+ROOT_HISTORY_MAX_SNAPSHOTS = 200
+
+def _compress_order_depth(order_depth: OrderDepth) -> dict[str, list[list[int]]]:
+    return {
+        "buy_orders": [[price, quantity] for price, quantity in sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)],
+        "sell_orders": [[price, quantity] for price, quantity in sorted(order_depth.sell_orders.items(), key=lambda x: x[0])],
+    }
+
+def _update_order_depth_history(state_data: dict[str, Any], timestamp: int, order_depths: dict[Symbol, OrderDepth]) -> None:
+    snapshot = {
+        "timestamp": timestamp,
+        "order_depths": {
+            symbol: _compress_order_depth(order_depth)
+            for symbol, order_depth in order_depths.items()
+        },
+    }
+
+    history = state_data.get(ROOT_HISTORY_STATE_KEY)
+    if not isinstance(history, list):
+        history = []
+    history.append(snapshot)
+    state_data[ROOT_HISTORY_STATE_KEY] = history
+
+
+def _prune_history_for_traderdata(state_data: dict[str, Any]) -> None:
+    history = state_data.get(ROOT_HISTORY_STATE_KEY)
+    if not isinstance(history, list) or not history:
+        return
+
+    if len(history) > ROOT_HISTORY_MAX_SNAPSHOTS:
+        history = history[-ROOT_HISTORY_MAX_SNAPSHOTS:]
+
+    state_data[ROOT_HISTORY_STATE_KEY] = history
+
+    if len(history) <= ROOT_HISTORY_MIN_SNAPSHOTS:
+        return
+
+    # Keep trimming a few oldest snapshots only if the serialized payload is still too large.
+    while len(history) > ROOT_HISTORY_MIN_SNAPSHOTS and len(jsonpickle.encode(state_data)) > ROOT_TRADERDATA_MAX_CHARS:
+        history = history[1:]
+        state_data[ROOT_HISTORY_STATE_KEY] = history
+
+
+def _linear_regression_predict(points: list[tuple[float, float]], x_value: float) -> float | None:
+    if len(points) < 2:
+        return None
+
+    x_sum = sum(x for x, _ in points)
+    y_sum = sum(y for _, y in points)
+    mean_x = x_sum / len(points)
+    mean_y = y_sum / len(points)
+
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in points)
+    denominator = sum((x - mean_x) ** 2 for x, _ in points)
+    if denominator == 0:
+        return mean_y
+
+    slope = numerator / denominator
+    intercept = mean_y - slope * mean_x
+    return slope * x_value + intercept
+
+
+def _aggregate_prices(prices: list[int]) -> float | None:
+    if not prices:
+        return None
+
+    if ROOT_HISTORY_AGGREGATION_MODE == "max":
+        return float(max(prices))
+    if ROOT_HISTORY_AGGREGATION_MODE == "min":
+        return float(min(prices))
+    return float(sum(prices) / len(prices))
+
+
+def _history_series(state_data: dict[str, Any], product: str, side: str, current_timestamp: int, limit: int = ROOT_HISTORY_LOOKBACK) -> list[tuple[int, float]]:
+    series: list[tuple[int, float]] = []
+    history = state_data.get(ROOT_HISTORY_STATE_KEY, {})
+    if not isinstance(history, list):
+        return series
+
+    for snapshot in reversed(history):
+        try:
+            timestamp = snapshot.get("timestamp")
+            if not isinstance(timestamp, int) or timestamp > current_timestamp:
+                continue
+            order_depths = snapshot.get("order_depths", {})
+            product_depth = order_depths.get(product)
+            if not isinstance(product_depth, dict):
+                continue
+
+            levels = product_depth.get(side, [])
+            if not isinstance(levels, list):
+                continue
+
+            prices = [level[0] for level in levels if isinstance(level, list) and len(level) >= 1 and isinstance(level[0], (int, float))]
+            aggregated_price = _aggregate_prices([int(price) for price in prices])
+            if aggregated_price is None:
+                continue
+
+            series.append((timestamp, aggregated_price))
+            if len(series) >= limit:
+                break
+        except Exception:
+            continue
+
+    return list(reversed(series))
 
 class Logger:
     def __init__(self) -> None:
@@ -298,39 +422,90 @@ class OsmiumTrader(BaseTrader):
         return {self.name: self.orders}
 
 class RootTrader(BaseTrader):
-    DRIFT_PER_TIMESTAMP = 0.001
-    ROUND_END_TIMESTAMP = 999900
-    TAKE_EDGE = 2
-    PASSIVE_LOOKAHEAD = 20
-
     def __init__(self, name: str, state: TradingState, trader_data: dict[str, Any]):
         super().__init__(name, state, trader_data, "INTARIAN_PEPPER_ROOT")
+        self.regression_bid_wall, self.regression_mid_wall, self.regression_ask_wall = self._regression_walls()
+        if self.regression_bid_wall is not None:
+            self.bid_wall = self.regression_bid_wall
+        if self.regression_ask_wall is not None:
+            self.ask_wall = self.regression_ask_wall
+        if self.regression_mid_wall is not None:
+            self.mid_wall = self.regression_mid_wall
+
+    def _regression_walls(self) -> tuple[int | None, float | None, int | None]:
+        bid_points = _history_series(self.trader_data, self.name, "buy_orders", self.state.timestamp)
+        ask_points = _history_series(self.trader_data, self.name, "sell_orders", self.state.timestamp)
+        current_timestamp = float(self.state.timestamp)
+        predicted_bid = _linear_regression_predict(bid_points, current_timestamp)
+        predicted_ask = _linear_regression_predict(ask_points, current_timestamp)
+
+        if predicted_bid is None:
+            predicted_bid = float(self.bid_wall) if self.bid_wall is not None else None
+        if predicted_ask is None:
+            predicted_ask = float(self.ask_wall) if self.ask_wall is not None else None
+
+        if predicted_bid is None and predicted_ask is None:
+            return self.bid_wall, self.mid_wall, self.ask_wall
+
+        if predicted_bid is None:
+            predicted_bid = predicted_ask
+        if predicted_ask is None:
+            predicted_ask = predicted_bid
+
+        bid_wall = floor(predicted_bid)
+        ask_wall = ceil(predicted_ask)
+        if bid_wall >= ask_wall:
+            center = (predicted_bid + predicted_ask) / 2
+            bid_wall = floor(center - 0.5)
+            ask_wall = max(ask_wall, bid_wall + 1)
+
+        mid_wall = (bid_wall + ask_wall) / 2
+        return bid_wall, mid_wall, ask_wall
+
+    def market_mid(self):
+        if self.mid_wall is not None:
+            return float(self.mid_wall)
+        return super().market_mid()
+
+    def microprice(self):
+        return self.market_mid()
+
+    def _inventory_shift(self) -> float:
+        position = self.state.position.get(self.product, 0)
+        lower = ROOT_TARGET_POSITION - ROOT_POSITION_BAND
+        upper = ROOT_TARGET_POSITION + ROOT_POSITION_BAND
+        clamped_position = max(lower, min(upper, position))
+        shift = ((ROOT_TARGET_POSITION - clamped_position) / ROOT_POSITION_BAND) * ROOT_EDGE_SHIFT
+        return shift
+
+    def _quote_sizes(self) -> tuple[int, int]:
+        position = self.state.position.get(self.product, 0)
+        lower = ROOT_TARGET_POSITION - ROOT_POSITION_BAND
+        upper = ROOT_TARGET_POSITION + ROOT_POSITION_BAND
+        clamped_position = max(lower, min(upper, position))
+        size_range = ROOT_MAX_ORDER_SIZE - ROOT_MIN_ORDER_SIZE
+
+        buy_ratio = (upper - clamped_position) / (2 * ROOT_POSITION_BAND)
+        sell_ratio = (clamped_position - lower) / (2 * ROOT_POSITION_BAND)
+
+        bid_size = min(self.max_buy_size, max(0, round(ROOT_MIN_ORDER_SIZE + size_range * buy_ratio)))
+        ask_size = min(self.max_sell_size, max(0, round(ROOT_MIN_ORDER_SIZE + size_range * sell_ratio)))
+        return bid_size, ask_size
     
     def get_orders(self):
         current_fair = self.microprice()
         if current_fair is None:
             return {self.name: self.orders}
 
-        remaining_drift = max(0, self.ROUND_END_TIMESTAMP - self.state.timestamp) * self.DRIFT_PER_TIMESTAMP
-        exit_fair = current_fair + remaining_drift
+        quote_mid = current_fair + self._inventory_shift()
+        bid_price = floor(quote_mid - (ROOT_QUOTE_SPREAD / 2))
+        ask_price = ceil(quote_mid + (ROOT_QUOTE_SPREAD / 2))
+        bid_size, ask_size = self._quote_sizes()
 
-        for price, quantity in self.mk_sell_orders.items():
-            if price <= exit_fair - self.TAKE_EDGE:
-                self.bid(price, quantity)
-            elif self.expected_position < 0 and price <= current_fair + self.PASSIVE_LOOKAHEAD:
-                self.bid(price, min(quantity, abs(self.expected_position)))
-
-        for price, quantity in self.mk_buy_orders.items():
-            if price >= exit_fair + self.TAKE_EDGE:
-                self.ask(price, quantity)
-
-        if self.max_buy_size > 0 and self.bid_wall is not None:
-            bid_ceiling = floor(current_fair + min(self.PASSIVE_LOOKAHEAD, remaining_drift) - self.TAKE_EDGE)
-            bid_price = min(self.bid_wall + 1, bid_ceiling)
-            if self.ask_wall is not None:
-                bid_price = min(bid_price, self.ask_wall - 1)
-            if bid_price > 0:
-                self.bid(bid_price, self.max_buy_size)
+        if bid_size > 0:
+            self.bid(bid_price, bid_size)
+        if ask_size > 0:
+            self.ask(ask_price, ask_size)
 
         return {self.name: self.orders}
 
@@ -339,11 +514,14 @@ class Trader:
     def run(self, state: TradingState):
         result:dict[str,list[Order]] = {}
         try:
-            new_trader_data = json.loads(state.traderData) if state.traderData else {}
+            new_trader_data = jsonpickle.decode(state.traderData) if state.traderData else {}
             if not isinstance(new_trader_data, dict):
                 new_trader_data = {}
         except Exception:
             new_trader_data = {}
+
+        _update_order_depth_history(new_trader_data, state.timestamp, state.order_depths)
+        _prune_history_for_traderdata(new_trader_data)
 
         product_traders = {
             "ASH_COATED_OSMIUM": OsmiumTrader,
@@ -356,8 +534,10 @@ class Trader:
                 trader = product_trader(symbol, state, new_trader_data)
                 result.update(trader.get_orders())
 
-        try: final_trader_data = json.dumps(new_trader_data, separators=(",", ":"))
-        except: final_trader_data = ''
+        try:
+            final_trader_data = jsonpickle.encode(new_trader_data)
+        except Exception:
+            final_trader_data = ""
         logger.flush(state, result, conversions, final_trader_data)
 
         return result, conversions, final_trader_data
