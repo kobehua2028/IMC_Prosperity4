@@ -1,4 +1,5 @@
 import json
+import random
 from math import ceil, floor
 from typing import Any
 
@@ -13,16 +14,31 @@ from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder
 ROOT_HISTORY_AGGREGATION_MODE = "avg"
 ROOT_HISTORY_LOOKBACK = 100
 ROOT_HISTORY_STATE_KEY = "order_depth_history"
-ROOT_QUOTE_SPREAD = 12
+ROOT_QUOTE_SPREAD = 5
+ROOT_TAKE_THROUGH = 2
+ROOT_EARLY_BUY_OFFSET = 10
+ROOT_BUY_PROFIT_BUFFER = 1
+ROOT_SELL_PROFIT_BUFFER = 1
 ROOT_POSITION_LIMIT = 80
-ROOT_EDGE_SHIFT = 8
+ROOT_EDGE_SHIFT = 10
+ROOT_PRICE_OFFSET = 5
 ROOT_TARGET_POSITION = 60
-ROOT_POSITION_BAND = 20
+ROOT_POSITION_MIN = 40
+ROOT_POSITION_MAX = 80
 ROOT_MIN_ORDER_SIZE = 40
 ROOT_MAX_ORDER_SIZE = 80
+ROOT_ADAPT_WINDOW = 10
+ROOT_PRICE_OFFSET_MIN = 0
+ROOT_PRICE_OFFSET_MAX = 10
+ROOT_EDGE_SHIFT_MIN = 5
+ROOT_EDGE_SHIFT_MAX = 15
 ROOT_TRADERDATA_MAX_CHARS = 45000
 ROOT_HISTORY_MIN_SNAPSHOTS = 25
 ROOT_HISTORY_MAX_SNAPSHOTS = 200
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 def _compress_order_depth(order_depth: OrderDepth) -> dict[str, list[list[int]]]:
     return {
@@ -63,25 +79,6 @@ def _prune_history_for_traderdata(state_data: dict[str, Any]) -> None:
     while len(history) > ROOT_HISTORY_MIN_SNAPSHOTS and len(jsonpickle.encode(state_data)) > ROOT_TRADERDATA_MAX_CHARS:
         history = history[1:]
         state_data[ROOT_HISTORY_STATE_KEY] = history
-
-
-def _linear_regression_predict(points: list[tuple[float, float]], x_value: float) -> float | None:
-    if len(points) < 2:
-        return None
-
-    x_sum = sum(x for x, _ in points)
-    y_sum = sum(y for _, y in points)
-    mean_x = x_sum / len(points)
-    mean_y = y_sum / len(points)
-
-    numerator = sum((x - mean_x) * (y - mean_y) for x, y in points)
-    denominator = sum((x - mean_x) ** 2 for x, _ in points)
-    if denominator == 0:
-        return mean_y
-
-    slope = numerator / denominator
-    intercept = mean_y - slope * mean_x
-    return slope * x_value + intercept
 
 
 def _aggregate_prices(prices: list[int]) -> float | None:
@@ -127,6 +124,7 @@ def _history_series(state_data: dict[str, Any], product: str, side: str, current
             continue
 
     return list(reversed(series))
+
 
 class Logger:
     def __init__(self) -> None:
@@ -424,43 +422,87 @@ class OsmiumTrader(BaseTrader):
 class RootTrader(BaseTrader):
     def __init__(self, name: str, state: TradingState, trader_data: dict[str, Any]):
         super().__init__(name, state, trader_data, "INTARIAN_PEPPER_ROOT")
-        self.regression_bid_wall, self.regression_mid_wall, self.regression_ask_wall = self._regression_walls()
-        if self.regression_bid_wall is not None:
-            self.bid_wall = self.regression_bid_wall
-        if self.regression_ask_wall is not None:
-            self.ask_wall = self.regression_ask_wall
-        if self.regression_mid_wall is not None:
-            self.mid_wall = self.regression_mid_wall
+        self._init_adaptive_params()
+        self.price_offset = self.adaptive_state["trial_params"]["price_offset"]
+        self.edge_shift = self.adaptive_state["trial_params"]["edge_shift"]
 
-    def _regression_walls(self) -> tuple[int | None, float | None, int | None]:
-        bid_points = _history_series(self.trader_data, self.name, "buy_orders", self.state.timestamp)
-        ask_points = _history_series(self.trader_data, self.name, "sell_orders", self.state.timestamp)
-        current_timestamp = float(self.state.timestamp)
-        predicted_bid = _linear_regression_predict(bid_points, current_timestamp)
-        predicted_ask = _linear_regression_predict(ask_points, current_timestamp)
+    def _init_adaptive_params(self) -> None:
+        adaptive = self.product_state.get("adaptive")
+        if not isinstance(adaptive, dict):
+            adaptive = {}
 
-        if predicted_bid is None:
-            predicted_bid = float(self.bid_wall) if self.bid_wall is not None else None
-        if predicted_ask is None:
-            predicted_ask = float(self.ask_wall) if self.ask_wall is not None else None
+        if "trial_params" not in adaptive:
+            adaptive["accepted_params"] = {
+                "price_offset": ROOT_PRICE_OFFSET,
+                "edge_shift": ROOT_EDGE_SHIFT,
+            }
+            adaptive["trial_params"] = dict(adaptive["accepted_params"])
+            adaptive["accepted_score"] = None
+            adaptive["trial_score"] = 0
+            adaptive["trial_step_count"] = 0
+            adaptive["step_size"] = 1.0
+            adaptive["trial_index"] = 0
 
-        if predicted_bid is None and predicted_ask is None:
-            return self.bid_wall, self.mid_wall, self.ask_wall
+        self.product_state["adaptive"] = adaptive
+        self.adaptive_state = adaptive
+        self._advance_adaptive_trial()
 
-        if predicted_bid is None:
-            predicted_bid = predicted_ask
-        if predicted_ask is None:
-            predicted_ask = predicted_bid
+    def _start_new_trial(self, base_params: dict[str, float], step_size: float) -> None:
+        rng = random.Random(self.state.timestamp + self.adaptive_state.get("trial_index", 0) * 9973)
 
-        bid_wall = floor(predicted_bid)
-        ask_wall = ceil(predicted_ask)
-        if bid_wall >= ask_wall:
-            center = (predicted_bid + predicted_ask) / 2
-            bid_wall = floor(center - 0.5)
-            ask_wall = max(ask_wall, bid_wall + 1)
+        offset_delta = rng.choice([-1, 0, 1]) * step_size
+        shift_delta = rng.choice([-1, 0, 1]) * step_size
 
-        mid_wall = (bid_wall + ask_wall) / 2
-        return bid_wall, mid_wall, ask_wall
+        trial_params = {
+            "price_offset": _clamp(
+                base_params["price_offset"] + offset_delta,
+                ROOT_PRICE_OFFSET_MIN,
+                ROOT_PRICE_OFFSET_MAX,
+            ),
+            "edge_shift": _clamp(
+                base_params["edge_shift"] + shift_delta,
+                ROOT_EDGE_SHIFT_MIN,
+                ROOT_EDGE_SHIFT_MAX,
+            ),
+        }
+
+        self.adaptive_state["trial_params"] = trial_params
+        self.adaptive_state["trial_score"] = 0
+        self.adaptive_state["trial_index"] = self.adaptive_state.get("trial_index", 0) + 1
+        self.price_offset = trial_params["price_offset"]
+        self.edge_shift = trial_params["edge_shift"]
+
+    def _advance_adaptive_trial(self) -> None:
+        adaptive = self.adaptive_state
+        step_count = adaptive.get("trial_step_count", 0) + 1
+        adaptive["trial_step_count"] = step_count
+
+        trial_score = adaptive.get("trial_score", 0)
+
+        if step_count < ROOT_ADAPT_WINDOW:
+            trial_params = adaptive.get("trial_params", adaptive.get("accepted_params", {}))
+            self.price_offset = trial_params.get("price_offset", ROOT_PRICE_OFFSET)
+            self.edge_shift = trial_params.get("edge_shift", ROOT_EDGE_SHIFT)
+            return
+
+        accepted_params = adaptive.get("accepted_params", {
+            "price_offset": ROOT_PRICE_OFFSET,
+            "edge_shift": ROOT_EDGE_SHIFT,
+        })
+        accepted_score = adaptive.get("accepted_score")
+
+        if accepted_score is None or trial_score >= accepted_score:
+            adaptive["accepted_params"] = dict(adaptive.get("trial_params", accepted_params))
+            adaptive["accepted_score"] = trial_score
+            step_size = max(0.5, adaptive.get("step_size", 1.0) * 0.95)
+        else:
+            step_size = min(3.0, adaptive.get("step_size", 1.0) * 1.05)
+
+        adaptive["step_size"] = step_size
+        adaptive["trial_step_count"] = 0
+        self._start_new_trial(adaptive["accepted_params"], step_size)
+        self.price_offset = self.adaptive_state["trial_params"]["price_offset"]
+        self.edge_shift = self.adaptive_state["trial_params"]["edge_shift"]
 
     def market_mid(self):
         if self.mid_wall is not None:
@@ -472,21 +514,67 @@ class RootTrader(BaseTrader):
 
     def _inventory_shift(self) -> float:
         position = self.state.position.get(self.product, 0)
-        lower = ROOT_TARGET_POSITION - ROOT_POSITION_BAND
-        upper = ROOT_TARGET_POSITION + ROOT_POSITION_BAND
-        clamped_position = max(lower, min(upper, position))
-        shift = ((ROOT_TARGET_POSITION - clamped_position) / ROOT_POSITION_BAND) * ROOT_EDGE_SHIFT
+        clamped_position = max(ROOT_POSITION_MIN, min(ROOT_POSITION_MAX, position))
+        shift = ((ROOT_TARGET_POSITION - clamped_position) / (ROOT_POSITION_MAX - ROOT_TARGET_POSITION)) * self.edge_shift
         return shift
+
+    def _take_buy_limit(self, fair_value: float) -> int:
+        return floor(fair_value - ROOT_BUY_PROFIT_BUFFER)
+
+    def _take_sell_limit(self, fair_value: float) -> int:
+        return ceil(fair_value + ROOT_SELL_PROFIT_BUFFER)
+
+    def _make_buy_price(self, fair_value: float) -> int | None:
+        profitable_bid = floor(fair_value - ROOT_BUY_PROFIT_BUFFER)
+        if self.bid_wall is None:
+            return profitable_bid
+
+        bid_price = self.bid_wall + 1
+        if self.ask_wall is not None:
+            bid_price = min(bid_price, self.ask_wall - 1)
+
+        bid_price = min(bid_price, profitable_bid)
+        if self.bid_wall is not None and bid_price <= self.bid_wall:
+            return None
+        return bid_price
+
+    def _make_sell_price(self, fair_value: float) -> int | None:
+        profitable_ask = ceil(fair_value + ROOT_SELL_PROFIT_BUFFER)
+        if self.ask_wall is None:
+            return profitable_ask
+
+        ask_price = self.ask_wall - 1
+        if self.bid_wall is not None:
+            ask_price = max(ask_price, self.bid_wall + 1)
+
+        ask_price = max(ask_price, profitable_ask)
+        if self.ask_wall is not None and ask_price >= self.ask_wall:
+            return None
+        return ask_price
+
+    def _takeable_buy_volume(self, limit_price: int) -> int:
+        volume = 0
+        for price, quantity in sorted(self.mk_sell_orders.items(), key=lambda item: item[0]):
+            if price > limit_price:
+                break
+            volume += quantity
+        return volume
+
+    def _takeable_sell_volume(self, limit_price: int) -> int:
+        volume = 0
+        for price, quantity in sorted(self.mk_buy_orders.items(), key=lambda item: item[0], reverse=True):
+            if price < limit_price:
+                break
+            volume += quantity
+        return volume
 
     def _quote_sizes(self) -> tuple[int, int]:
         position = self.state.position.get(self.product, 0)
-        lower = ROOT_TARGET_POSITION - ROOT_POSITION_BAND
-        upper = ROOT_TARGET_POSITION + ROOT_POSITION_BAND
-        clamped_position = max(lower, min(upper, position))
+        clamped_position = max(ROOT_POSITION_MIN, min(ROOT_POSITION_MAX, position))
         size_range = ROOT_MAX_ORDER_SIZE - ROOT_MIN_ORDER_SIZE
 
-        buy_ratio = (upper - clamped_position) / (2 * ROOT_POSITION_BAND)
-        sell_ratio = (clamped_position - lower) / (2 * ROOT_POSITION_BAND)
+        buy_ratio = (ROOT_POSITION_MAX - clamped_position) / (ROOT_POSITION_MAX - ROOT_POSITION_MIN)
+        sell_ratio = (clamped_position - ROOT_POSITION_MIN) / (ROOT_POSITION_MAX - ROOT_POSITION_MIN)
 
         bid_size = min(self.max_buy_size, max(0, round(ROOT_MIN_ORDER_SIZE + size_range * buy_ratio)))
         ask_size = min(self.max_sell_size, max(0, round(ROOT_MIN_ORDER_SIZE + size_range * sell_ratio)))
@@ -497,15 +585,56 @@ class RootTrader(BaseTrader):
         if current_fair is None:
             return {self.name: self.orders}
 
-        quote_mid = current_fair + self._inventory_shift()
-        bid_price = floor(quote_mid - (ROOT_QUOTE_SPREAD / 2))
-        ask_price = ceil(quote_mid + (ROOT_QUOTE_SPREAD / 2))
+        self._advance_adaptive_trial()
+        position = self.state.position.get(self.product, 0)
         bid_size, ask_size = self._quote_sizes()
 
-        if bid_size > 0:
-            self.bid(bid_price, bid_size)
-        if ask_size > 0:
-            self.ask(ask_price, ask_size)
+        if position < ROOT_TARGET_POSITION:
+            if position <= ROOT_POSITION_MIN:
+                buy_limit = ceil(current_fair + ROOT_EARLY_BUY_OFFSET)
+            else:
+                buy_limit = self._take_buy_limit(current_fair)
+            take_buy_size = min(self.max_buy_size, self._takeable_buy_volume(buy_limit))
+            if take_buy_size > 0:
+                self.bid(buy_limit, take_buy_size)
+
+            make_buy_price = self._make_buy_price(current_fair)
+            make_buy_size = min(self.max_buy_size, bid_size)
+            if make_buy_price is not None and make_buy_size > 0:
+                self.bid(make_buy_price, make_buy_size)
+        elif position > ROOT_TARGET_POSITION:
+            sell_limit = self._take_sell_limit(current_fair)
+            take_sell_size = min(self.max_sell_size, self._takeable_sell_volume(sell_limit))
+            if take_sell_size > 0:
+                self.ask(sell_limit, take_sell_size)
+
+            make_sell_price = self._make_sell_price(current_fair)
+            make_sell_size = min(self.max_sell_size, ask_size)
+            if make_sell_price is not None and make_sell_size > 0:
+                self.ask(make_sell_price, make_sell_size)
+        else:
+            buy_limit = self._take_buy_limit(current_fair)
+            sell_limit = self._take_sell_limit(current_fair)
+            take_buy_size = min(self.max_buy_size, self._takeable_buy_volume(buy_limit))
+            take_sell_size = min(self.max_sell_size, self._takeable_sell_volume(sell_limit))
+            if take_buy_size > 0:
+                self.bid(buy_limit, take_buy_size)
+            if take_sell_size > 0:
+                self.ask(sell_limit, take_sell_size)
+
+            make_buy_price = self._make_buy_price(current_fair)
+            make_sell_price = self._make_sell_price(current_fair)
+            make_buy_size = min(self.max_buy_size, bid_size)
+            make_sell_size = min(self.max_sell_size, ask_size)
+            if make_buy_price is not None and make_buy_size > 0:
+                self.bid(make_buy_price, make_buy_size)
+            if make_sell_price is not None and make_sell_size > 0:
+                self.ask(make_sell_price, make_sell_size)
+
+        executed_volume = 0
+        for trade in self.state.own_trades.get(self.name, []):
+            executed_volume += abs(trade.quantity)
+        self.adaptive_state["trial_score"] = self.adaptive_state.get("trial_score", 0) + executed_volume
 
         return {self.name: self.orders}
 
